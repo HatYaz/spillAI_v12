@@ -55,7 +55,7 @@ class OceanDataApp:
         self.lon_entry.pack()
 
         # Time Interval Entry
-        tk.Label(self.root, text="Time Interval (hours):").pack()
+        tk.Label(self.root, text="Historical Data Time Interval (hours):").pack()
         self.time_interval_entry = tk.Entry(self.root)
         self.time_interval_entry.pack()
 
