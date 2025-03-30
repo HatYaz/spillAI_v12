@@ -1,0 +1,266 @@
+"""
+Ref. 
+Hatem.Yazidi@gmail.com 
+03/2025 
+"""
+import netCDF4
+import numpy as np
+import os
+import requests
+import pandas as pd
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, Label, Tk
+from datetime import datetime
+from sklearn.ensemble import RandomForestRegressor
+import threading
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import cartopy.feature as cfeature
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+
+# Constants
+BASE_URL = "https://dd.weather.gc.ca/model_wcps/ocean-atmosphere/1km/00/{hh}/"
+VARIABLES = {
+    "SeaWaterVelocityX": "DBS-0.5m",
+    "SeaWaterVelocityY": "DBS-0.5m",
+    "WindU": "AGL-10m",
+    "WindV": "AGL-10m"
+}
+INVALID_VALUE = 1.0000000200408773e+20
+
+class OceanDataApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Ocean Data Prediction")
+        self.root.geometry("1100x1200")
+        self.data_dir = ""
+        self.excel_path = ""
+        self.stop_threads = False
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Map Button
+        open_map_button = tk.Button(self.root, text="Open Map", command=self.open_map, bg='purple', fg='white')
+        open_map_button.pack()
+
+        # Latitude Entry
+        tk.Label(self.root, text="Latitude:").pack()
+        self.lat_entry = tk.Entry(self.root)
+        self.lat_entry.pack()
+
+        # Longitude Entry
+        tk.Label(self.root, text="Longitude:").pack()
+        self.lon_entry = tk.Entry(self.root)
+        self.lon_entry.pack()
+
+        # Time Interval Entry
+        tk.Label(self.root, text="Time Interval (hours):").pack()
+        self.time_interval_entry = tk.Entry(self.root)
+        self.time_interval_entry.pack()
+
+        # Browse Data Directory Button
+        tk.Button(self.root, text="Browse Data Directory", bg='purple', fg='white', command=self.browse_data_dir).pack()
+        self.data_dir_label = tk.Label(self.root, text="Data Directory: Not selected")
+        self.data_dir_label.pack()
+
+        # Browse Save Location Button
+        tk.Button(self.root, text="Browse Results Save Directory", bg='purple', fg='white', command=self.browse_save_location).pack()
+        self.save_location_label = tk.Label(self.root, text="Results Location: Not selected")
+        self.save_location_label.pack()
+
+        # Submit Button
+        submit_button = tk.Button(self.root, text="Submit", command=self.on_submit, bg='purple', fg='white')
+        submit_button.pack()
+
+        # Exit Button
+        exit_button = tk.Button(self.root, text="Exit", command=self.exit_application, bg='red', fg='white')
+        exit_button.pack(pady=10)
+
+        # Progress Label
+        self.progress_label = tk.Label(self.root, text="The names of the downloaded files will be displayed here...", fg='blue')
+        self.progress_label.pack()
+
+        # Results Title
+        title_label = Label(self.root, text="Results Table", font=("Arial", 14, "bold"), fg='blue')
+        title_label.pack(pady=5)
+
+        # Treeview for Results
+        self.tree = ttk.Treeview(self.root, columns=("Time", "Variable", "Value"), show="headings")
+        self.tree.heading("Time", text="Time", anchor="center")
+        self.tree.heading("Variable", text="Variable", anchor="center")
+        self.tree.heading("Value", text="Value", anchor="center")
+        self.tree.column("Time", width=10, anchor="center")
+        self.tree.column("Variable", width=15, anchor="center")
+        self.tree.column("Value", width=10, anchor="center")
+        self.tree.pack(expand=True, fill="both")
+
+    def adjust_longitude(self, longitudes):
+        return np.where(longitudes > 180, longitudes - 360, longitudes)
+
+    def find_nearest_index(self, latitudes, longitudes, target_lat, target_lon):
+        lat_idx = np.argmin(np.abs(latitudes - target_lat))
+        lon_idx = np.argmin(np.abs(longitudes - target_lon))
+        return lat_idx, lon_idx
+
+    def extract_values_near_location(self, file_path, target_lat, target_lon):
+        results = []
+        try:
+            with netCDF4.Dataset(file_path, 'r') as dataset:
+                latitudes = dataset.variables['latitude'][:]
+                longitudes = self.adjust_longitude(dataset.variables['longitude'][:])
+                lat_idx, lon_idx = self.find_nearest_index(latitudes, longitudes, target_lat, target_lon)
+                time_values = dataset.variables['time'][:]
+                for var_name, var in dataset.variables.items():
+                    if 'latitude' in var.dimensions and 'longitude' in var.dimensions:
+                        var_values = var[:]
+                        for t_idx, t_value in enumerate(time_values):
+                            value = var_values[t_idx, lat_idx, lon_idx]
+                            if np.isfinite(value) and value != INVALID_VALUE:
+                                results.append([t_value, var_name, value])
+        except Exception as e:
+            messagebox.showerror("Error", f"Error reading file: {e}")
+        return results
+
+    def download_netcdf_files(self, time_interval):
+        today = datetime.utcnow().strftime("%Y%m%d")
+        for hh in range(time_interval):
+            if self.stop_threads:
+                break
+            hh_str = f"{hh:03d}"
+            for var, height in VARIABLES.items():
+                filename = f"{today}T00Z_MSC_WCPS_{var}_{height}_LatLon0.008_PT{hh_str}H.nc"
+                url = BASE_URL.format(hh=hh_str) + filename
+                file_path = os.path.join(self.data_dir, filename)
+                if not os.path.exists(file_path):
+                    try:
+                        response = requests.get(url)
+                        if response.status_code == 200:
+                            with open(file_path, "wb") as f:
+                                f.write(response.content)
+                        else:
+                            messagebox.showerror("Error", f"Failed to download {filename}")
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Error downloading file: {e}")
+                self.progress_label.config(text=f"Downloading: {filename}")
+
+    def train_and_predict(self, df):
+        predictions = {}
+        numeric_columns = ['uwindsurf', 'vomecrty', 'vozocrtx', 'vwindsurf']
+        for var in numeric_columns:
+            if var in df.columns:
+                values = pd.to_numeric(df[var], errors='coerce').dropna().values
+                if len(values) > 1:
+                    X = np.arange(len(values)).reshape(-1, 1)
+                    y = values
+                    model = RandomForestRegressor(n_estimators=100, random_state=42)
+                    model.fit(X, y)
+                    next_x = np.array([[len(values)]])
+                    predictions[var] = float(model.predict(next_x)[0])
+        return predictions
+
+    def process_data(self, lat, lon, time_interval):
+        self.download_netcdf_files(time_interval)
+        all_data = []
+        today = datetime.utcnow().strftime("%Y%m%d")
+        for hh in range(time_interval):
+            if self.stop_threads:
+                break
+            hh_str = f"{hh:03d}"
+            for var, height in VARIABLES.items():
+                filename = f"{today}T00Z_MSC_WCPS_{var}_{height}_LatLon0.008_PT{hh_str}H.nc"
+                file_path = os.path.join(self.data_dir, filename)
+                if os.path.exists(file_path):
+                    data = self.extract_values_near_location(file_path, lat, lon)
+                    all_data.extend(data)
+        df = pd.DataFrame(all_data, columns=["Time", "Variable", "Value"])
+        return df, self.train_and_predict(df.pivot_table(index="Time", columns="Variable", values="Value", aggfunc="first"))
+
+    def on_map_click(self, event):
+        lon, lat = event.xdata, event.ydata
+        if lon is not None and lat is not None:
+            self.lat_entry.delete(0, tk.END)
+            self.lat_entry.insert(0, f"{lat:.2f}")
+            self.lon_entry.delete(0, tk.END)
+            self.lon_entry.insert(0, f"{lon:.2f}")
+
+    def update_results(self, lat, lon, time_interval):
+        df, predictions = self.process_data(lat, lon, time_interval)
+
+        # Clear the previous data from the tree
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        # Format time and add corresponding variables for each HH
+        df['Time'] = pd.to_datetime(df['Time'], unit='s').dt.strftime('%Y%m%d %H:%M')
+
+        # Insert data into the treeview, now grouped by hour
+        grouped_data = df.groupby(df['Time'].str[:13])
+        for time_group, group in grouped_data:
+            self.tree.insert("", "end", values=(time_group, "", ""))
+            for row in group.itertuples():
+                self.tree.insert("", "end", values=("", row.Variable, row.Value))
+
+        # Save data to Excel with predictions in Sheet2
+        with pd.ExcelWriter(self.excel_path, engine='openpyxl', mode='a' if os.path.exists(self.excel_path) else 'w') as writer:
+            df.to_excel(writer, sheet_name='Sheet1', index=False)
+            pred_df = pd.DataFrame(list(predictions.items()), columns=['Variable', 'Predicted Value'])
+            pred_df.to_excel(writer, sheet_name='Sheet2', index=False)
+
+        # Update the plot in the main thread using after
+        def plot_update():
+            fig, ax = plt.subplots()
+            ax.bar(predictions.keys(), predictions.values())
+            ax.set_title("Predicted Values")
+            canvas = FigureCanvasTkAgg(fig, master=self.root)
+            canvas.get_tk_widget().pack()
+            canvas.draw()
+
+        self.root.after(0, plot_update)
+
+    def open_map(self):
+        map_window = tk.Toplevel(self.root)
+        map_window.title("Select Location")
+
+        fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()})
+        ax.set_extent([-95, -55, 40, 60])
+        ax.add_feature(cfeature.LAND, edgecolor='black')
+        ax.add_feature(cfeature.OCEAN, facecolor='lightblue')
+        ax.add_feature(cfeature.LAKES, facecolor='lightblue', edgecolor='blue')
+        ax.add_feature(cfeature.RIVERS, edgecolor='blue', facecolor='none')
+        ax.add_feature(cfeature.COASTLINE)
+        ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=1)
+
+        canvas = FigureCanvasTkAgg(fig, master=map_window)
+        canvas.get_tk_widget().pack()
+        fig.canvas.mpl_connect("button_press_event", self.on_map_click)
+
+    def on_submit(self):
+        try:
+            lat = float(self.lat_entry.get())
+            lon = float(self.lon_entry.get())
+            time_interval = int(self.time_interval_entry.get())
+            if not self.data_dir or not self.excel_path:
+                raise ValueError("Data directory or save location not selected.")
+            threading.Thread(target=self.update_results, args=(lat, lon, time_interval), daemon=True).start()
+        except ValueError as e:
+            messagebox.showerror("Error", f"Invalid input: {e}")
+
+    def browse_data_dir(self):
+        self.data_dir = filedialog.askdirectory(title="Select Data Directory")
+        if self.data_dir:
+            self.data_dir_label.config(text=f"Data Directory: {self.data_dir}")
+
+    def browse_save_location(self):
+        self.excel_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+        if self.excel_path:
+            self.save_location_label.config(text=f"Save Results location: {self.excel_path}")
+
+    def exit_application(self):
+        self.stop_threads = True
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = OceanDataApp(root)
+    root.mainloop()
